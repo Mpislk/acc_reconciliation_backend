@@ -15,6 +15,8 @@ scikit-learn>=1.3.0
 # Google Generative AI (Gemini)
 google-generativeai>=0.3.2
 
+openai
+
 # File Handling (Excel support)
 openpyxl>=3.1.2
 xlrd>=2.0.1
@@ -22,5 +24,10 @@ xlrd>=2.0.1
 # Security
 Werkzeug>=2.3.7
 
+# encryption
+cryptography==41.0.4
+
 # Optional: For better performance with large datasets
 # pyarrow>=13.0.0
+#pandas==2.0.3
+

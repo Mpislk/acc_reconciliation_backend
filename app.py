@@ -1,4 +1,3 @@
-# backend_app.py
 import os
 import pandas as pd
 from flask import Flask, request, jsonify
@@ -6,497 +5,1211 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 import traceback
+import json
+import logging
+from datetime import datetime
+import hashlib
+import base64
+from cryptography.fernet import Fernet
+import re
 import google.generativeai as genai
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-#from datetime import timedelta
+import openai
+from openai import OpenAI
 
-
-# Load environment variables (for GEMINI_API_KEY)
+# Load environment variables
 load_dotenv()
 
-app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# --- Configuration ---
-UPLOAD_FOLDER = '../uploads' # Relative path to a folder outside the app root
+
+# Validate required environment variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("Missing OPENAI_API_KEY in .env file. Please create one and add your key.")
+
+# Create OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
+CHATGPT_MODEL = "gpt-3.5-turbo"
+
+# --- Gemini API Configuration ---
+# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# if not GEMINI_API_KEY:
+#     raise ValueError("GEMINI_API_KEY not found in environment variables. Please set it in your .env file.")
+# genai.configure(api_key=GEMINI_API_KEY)
+
+# model = genai.GenerativeModel('gemini-1.5-pro')
+
+
+
+# Flask app configuration
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Configuration
+UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
 ALLOWED_EXTENSIONS = {'csv', 'xlsx', 'xls'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 # 16MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 
 # Ensure upload directory exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# --- Gemini API Configuration ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in environment variables. Please set it in your .env file.")
-genai.configure(api_key=GEMINI_API_KEY)
-
-# --- Matching Parameters (Adjust as needed) ---
-AMOUNT_TOLERANCE = 500 # Allow for very small discrepancies in amount (e.g., due to rounding)
-DATE_TOLERANCE_DAYS = 5 # Allow dates to be off by up to 5 days
-SEMANTIC_SIMILARITY_THRESHOLD = 0.75 # Cosine similarity threshold for semantic match (0.0 to 1.0)
+# Generate encryption key (in production, store this securely)
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+cipher_suite = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
 
 # --- Helper Functions ---
 
 def allowed_file(filename):
-    """Checks if the file extension is allowed."""
+    """Check if the file extension is allowed."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def parse_file(filepath, file_type):
-    """Parses uploaded CSV/Excel files into a list of dictionaries."""
+def read_file(file_path):
+    """Read CSV or Excel file and return DataFrame."""
     try:
-        print(f"\n--- Parsing {file_type} ---")
-        print(f"File path: {filepath}")
-
-        # Read file based on extension
-        if filepath.endswith('.csv'):
-            df = pd.read_csv(filepath)
-        else: # Excel files
-            df = pd.read_excel(filepath, sheet_name=0, header=0) # Read first sheet
-
-        print(f"Original shape: {df.shape}")
-        print(f"Original columns: {list(df.columns)}")
-
-        # Convert to dictionary format for JSON serialization
-        # Replace NaN with empty string for JSON compatibility before converting to dict
-        data = df.fillna("").to_dict('records')
-
-        return {
-            'success': True,
-            'data': data,
-            'columns': list(df.columns),
-            'row_count': len(df),
-            'file_type': file_type
-        }
+        file_extension = file_path.split('.')[-1].lower()
+        
+        if file_extension == 'csv':
+            # Try different encodings for CSV files
+            encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
+            for encoding in encodings:
+                try:
+                    df = pd.read_csv(file_path, encoding=encoding)
+                    logger.info(f"Successfully read CSV with {encoding} encoding")
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                raise ValueError("Could not read CSV file with any supported encoding")
+                
+        elif file_extension in ['xlsx', 'xls']:
+            df = pd.read_excel(file_path)
+        else:
+            raise ValueError(f"Unsupported file format: {file_extension}")
+        
+        return df
     except Exception as e:
-        print(f"Error parsing {file_type}: {str(e)}")
-        traceback.print_exc()
-        return {
-            'success': False,
-            'error': str(e),
-            'file_type': file_type
-        }
+        logger.error(f"Error reading file {file_path}: {str(e)}")
+        raise
 
-def preprocess_data(bank_data_dict, invoice_data_dict):
-    """
-    Cleans and standardizes data from both bank and invoice files for matching.
-    Adds 'Description_Clean', 'Amount', 'Date' in standardized formats.
-    """
-    print("\n--- Starting Data Preprocessing ---")
-
-    # Ensure data is not empty before creating DataFrame
-    bank_df = pd.DataFrame(bank_data_dict['data']) if bank_data_dict and bank_data_dict['data'] else pd.DataFrame()
-    invoice_df = pd.DataFrame(invoice_data_dict['data']) if invoice_data_dict and invoice_data_dict['data'] else pd.DataFrame()
-
-    if bank_df.empty or invoice_df.empty:
-        print("Warning: One or both DataFrames are empty after initial loading.")
-        return {
-            'bank_data_processed': [],
-            'invoice_data_processed': [],
-            'preprocessing_info': {
-                'bank_original_rows': len(bank_df),
-                'bank_processed_rows': 0,
-                'invoice_original_rows': len(invoice_df),
-                'invoice_processed_rows': 0
-            }
-        }
-
-    # --- BANK STATEMENT PREPROCESSING ---
-    # Remove columns that are completely empty (as per requirement: Bank ID, Account Number, End to End ID)
-    bank_df_initial_shape = bank_df.shape
-    bank_df = bank_df.dropna(axis=1, how='all')
-    print(f"Bank statement shape after dropping all-NaN columns: {bank_df_initial_shape} -> {bank_df.shape}")
-
-    # Standardize 'Date' column
-    if 'Date' in bank_df.columns:
-        bank_df['Date'] = pd.to_datetime(bank_df['Date'], errors='coerce')
-    else:
-        bank_df['Date'] = pd.NaT # Set to Not a Time if column missing
-
-    # Combine Credit and Debit amounts into a single 'Amount' column
-    if 'Credit Amount' in bank_df.columns and 'Debit Amount' in bank_df.columns:
-        bank_df['Credit Amount'] = pd.to_numeric(bank_df['Credit Amount'], errors='coerce').fillna(0)
-        bank_df['Debit Amount'] = pd.to_numeric(bank_df['Debit Amount'], errors='coerce').fillna(0)
-        bank_df['Amount'] = bank_df['Credit Amount'] - bank_df['Debit Amount'] # Credit as positive, Debit as negative
-    elif 'Amount' in bank_df.columns: # If there's already a single 'Amount' column
-        bank_df['Amount'] = pd.to_numeric(bank_df['Amount'], errors='coerce').fillna(0)
-    else:
-        bank_df['Amount'] = 0.0 # Default if no amount column
-
-    # --- ENHANCEMENT: Combine relevant text fields for Bank Statement Description_Clean ---
-    # This ensures names, KAI numbers, and other details from various columns are included for embedding
-    bank_df['Description_Clean'] = bank_df.apply(lambda row:
-        " ".join(filter(None, [
-            str(row.get('Description', '')).strip(), # Primary description, often contains names & KAI
-            str(row.get('Tran Type', '')).strip(),
-            str(row.get('Customer Ref #', '')).strip(), # Might contain hidden dates or KAI-like numbers
-            str(row.get('Bank Ref #', '')).strip(),
-            str(row.get('Account Title', '')).strip(),
-            str(row.get('Account Owner', '')).strip()
-        ])).lower(), axis=1
-    )
-    bank_df['Description_Clean'] = bank_df['Description_Clean'].str.replace(r'\s+', ' ', regex=True).str.strip()
-
-
-    # --- INVOICE PREPROCESSING ---
-    invoice_df_initial_shape = invoice_df.shape
-    invoice_df = invoice_df.dropna(axis=1, how='all')
-    print(f"Invoices shape after dropping all-NaN columns: {invoice_df_initial_shape} -> {invoice_df.shape}")
-
-    # Standardize 'Date' column
-    if 'Date' in invoice_df.columns:
-        invoice_df['Date'] = pd.to_datetime(invoice_df['Date'], errors='coerce')
-    else:
-        invoice_df['Date'] = pd.NaT
-
-    # Ensure 'Amount' is numeric
-    if 'Amount' in invoice_df.columns:
-        invoice_df['Amount'] = pd.to_numeric(invoice_df['Amount'], errors='coerce').fillna(0)
-    else:
-        invoice_df['Amount'] = 0.0
-
-    # --- ENHANCEMENT: Combine relevant text fields for Invoice Description_Clean ---
-    # This ensures Customer names and KAI numbers (from No.) are included for embedding
-    invoice_df['Description_Clean'] = invoice_df.apply(lambda row:
-        " ".join(filter(None, [
-            str(row.get('Type', '')).strip(),
-            str(row.get('No.', '')).strip(), # Contains the 'KAI' number for invoices
-            str(row.get('Customer', '')).strip(), # Contains the customer name
-            str(row.get('Memo', '')).strip() # Include 'Memo' column content if available
-        ])).lower(),
-        axis=1
-    )
-    invoice_df['Description_Clean'] = invoice_df['Description_Clean'].str.replace(r'\s+', ' ', regex=True).str.strip()
-
-
-    # Remove rows with invalid dates or amounts after conversion
-    # And filter out entries where cleaned description is empty or just whitespace
-    bank_df_cleaned = bank_df.dropna(subset=['Date', 'Amount']).copy()
-    bank_df_cleaned = bank_df_cleaned[bank_df_cleaned['Description_Clean'].str.strip() != ''].copy()
-
-    invoice_df_cleaned = invoice_df.dropna(subset=['Date', 'Amount']).copy()
-    invoice_df_cleaned = invoice_df_cleaned[invoice_df_cleaned['Description_Clean'].str.strip() != ''].copy()
-
-
-    print(f"Bank statement after preprocessing: {bank_df_cleaned.shape}")
-    print(f"Invoices after preprocessing: {invoice_df_cleaned.shape}")
-
-    return {
-        'bank_data_processed': bank_df_cleaned.to_dict('records'),
-        'invoice_data_processed': invoice_df_cleaned.to_dict('records'),
-        'preprocessing_info': {
-            'bank_original_rows': len(bank_df),
-            'bank_processed_rows': len(bank_df_cleaned),
-            'invoice_original_rows': len(invoice_df),
-            'invoice_processed_rows': len(invoice_df_cleaned)
-        }
-    }
-
-def get_embedding(text, model="models/embedding-001"):
-    """Generates an embedding for the given text using the specified Gemini model."""
-    if not text or not isinstance(text, str) or text.strip() == "":
-        return None # Handle empty, non-string, or whitespace-only text gracefully
+def basic_cleanup(df):
+    """Basic cleanup - only remove completely empty rows and clean column names."""
     try:
-        # Gemini embedding models have a rate limit, handle potential errors
-        result = genai.embed_content(model=model, content=text)
-        return result["embedding"]
+        # Remove completely empty rows
+        df_cleaned = df.dropna(how='all')
+        
+        # Remove rows where all values are empty strings
+        df_cleaned = df_cleaned[~(df_cleaned.astype(str) == '').all(axis=1)]
+        
+        # Clean column names
+        df_cleaned.columns = df_cleaned.columns.str.strip()
+        
+        logger.info(f"Basic cleanup: {len(df)} -> {len(df_cleaned)} rows")
+        return df_cleaned
+        
     except Exception as e:
-        print(f"Error generating embedding for text '{text[:50]}...': {e}")
-        return None
+        logger.error(f"Error in basic cleanup: {str(e)}")
+        raise
 
-def calculate_confidence(amount_matched, date_matched, semantic_score):
-    """
-    Calculates a confidence score for a match based on criteria,
-    prioritizing amount and semantic similarity (name/KAI) over date.
-    """
-    score = 0.0
-    reason_parts = []
+def identify_sensitive_columns(df):
+    """Identify columns that likely contain sensitive information."""
+    sensitive_patterns = [
+        r'.*account.*num.*',
+        r'.*account.*no.*',
+        r'.*acc.*num.*',
+        r'.*acc.*no.*',
+        r'.*name.*',
+        r'.*customer.*',
+        r'.*client.*',
+        r'.*phone.*',
+        r'.*mobile.*',
+        r'.*email.*',
+        r'.*address.*',
+        r'.*ssn.*',
+        r'.*social.*security.*',
+        r'.*tax.*id.*',
+        r'.*ein.*',
+        r'.*routing.*',
+        r'.*iban.*',
+        r'.*swift.*'
+    ]
+    
+    sensitive_columns = []
+    for col in df.columns:
+        col_lower = col.lower().strip()
+        for pattern in sensitive_patterns:
+            if re.match(pattern, col_lower):
+                sensitive_columns.append(col)
+                break
+    
+    return sensitive_columns
 
-    # Amount match is a very strong indicator
-    if amount_matched:
-        score += 0.45 # High weight
-        reason_parts.append("Amount matched")
+def encrypt_sensitive_data(df):
+    """Encrypt sensitive data in the DataFrame."""
+    df_encrypted = df.copy()
+    sensitive_columns = identify_sensitive_columns(df)
+    
+    for col in sensitive_columns:
+        if col in df_encrypted.columns:
+            df_encrypted[col] = df_encrypted[col].astype(str).apply(
+                lambda x: cipher_suite.encrypt(x.encode()).decode() if pd.notna(x) and x != '' else x
+            )
+    
+    logger.info(f"Encrypted sensitive columns: {sensitive_columns}")
+    return df_encrypted, sensitive_columns
 
-    # Semantic similarity is critical for name/KAI number matching and is given high importance
-    if semantic_score is not None and semantic_score >= SEMANTIC_SIMILARITY_THRESHOLD:
-        score += 0.45 * semantic_score # High weight, scaled by the actual similarity score
-        reason_parts.append(f"Strong semantic match (score: {semantic_score:.2f})")
-    elif semantic_score is not None:
-         reason_parts.append(f"Semantic similarity low (score: {semantic_score:.2f})")
+def preprocess_important_columns(df, important_columns, file_type="general"):
+    """Clean and preprocess only the important columns identified by LLM."""
+    try:
+        df_processed = df.copy()
+        
+        # Only process the important columns
+        for col in important_columns:
+            if col not in df_processed.columns:
+                continue
+                
+            col_lower = col.lower()
+            
+            # Convert numeric columns (amounts, values, etc.)
+            if any(keyword in col_lower for keyword in ['amount', 'value', 'price', 'total', 'sum', 'balance', 'debit', 'credit']):
+                # Clean numeric data - remove currency symbols, commas, etc.
+                df_processed[col] = df_processed[col].astype(str).str.replace(r'[^\d.-]', '', regex=True)
+                df_processed[col] = pd.to_numeric(df_processed[col], errors='coerce')
+                logger.info(f"Processed numeric column: {col}")
+            
+            # Handle date columns
+            elif any(keyword in col_lower for keyword in ['date', 'time', 'created', 'updated', 'transaction_date', 'posting_date']):
+                try:
+                    df_processed[col] = pd.to_datetime(df_processed[col], errors='coerce')
+                    logger.info(f"Processed date column: {col}")
+                except:
+                    logger.warning(f"Could not process date column: {col}")
+                    pass
+            
+            # Handle text columns (descriptions, references)
+            elif any(keyword in col_lower for keyword in ['description', 'reference', 'memo', 'notes', 'details']):
+                # Clean and standardize text
+                df_processed[col] = df_processed[col].astype(str).str.strip().str.upper()
+                logger.info(f"Processed text column: {col}")
+        
+        logger.info(f"Preprocessed important columns for {file_type}: {important_columns}")
+        return df_processed
+        
+    except Exception as e:
+        logger.error(f"Error preprocessing important columns for {file_type}: {str(e)}")
+        raise
 
-    # Date proximity is now given lower importance as per user's guidance
-    if date_matched:
-        score += 0.10 # Reduced weight
-        reason_parts.append("Date matched (within tolerance)")
+def get_column_identification_prompt(bank_sample, invoice_sample):
+    """Create prompt for LLM to identify key columns for matching."""
+    prompt = f"""
+You are a financial data analyst and expert in account reconciliation. I need you to analyze two datasets and identify the key columns required for transaction matching.
 
-    # Normalize score to 0-1 range or cap at 1.0
-    confidence = min(score, 1.0)
-    reason = ", ".join(reason_parts) if reason_parts else "No strong matching criteria met"
-    return confidence, reason
+**Bank Statement Sample (first 5 rows):**
+{bank_sample.to_string()}
 
-# --- Flask Routes ---
+**Invoice Data Sample (first 5 rows):**
+{invoice_sample.to_string()}
+
+Please analyze these datasets and identify:
+1. Key columns from the bank statement that are essential for transaction matching
+2. Key columns from the invoice data that are essential for transaction matching
+3. The matching logic that should be used
+
+Return your response in the following JSON format:
+{{
+    "bank_key_columns": ["column1", "column2", ...],
+    "invoice_key_columns": ["column1", "column2", ...],
+    "matching_strategy": "Brief explanation of how these transactions should be matched",
+    "primary_match_fields": {{
+        "bank": "primary_field_name",
+        "invoice": "primary_field_name"
+    }},
+    "secondary_match_fields": {{
+        "bank": ["field1", "field2"],
+        "invoice": ["field1", "field2"]
+    }}
+}}
+
+Focus on columns that typically contain:
+- Transaction amounts/values
+- Dates
+- Reference numbers/IDs
+- Vendor/customer information
+- Transaction descriptions
+- Any unique identifiers
+
+Exclude any encrypted or sensitive personal information columns.
+"""
+    return prompt
+
+def get_matching_prompt(bank_data, invoice_data, column_info):
+    """Create prompt for LLM to match transactions."""
+    prompt = f"""
+You are a financial reconciliation expert. Please match transactions between bank statement and invoice data based on the following criteria:
+
+**Column Information:**
+- Bank key columns: {column_info['bank_key_columns']}
+- Invoice key columns: {column_info['invoice_key_columns']}
+- Primary match fields - Bank: {column_info['primary_match_fields']['bank']}, Invoice: {column_info['primary_match_fields']['invoice']}
+- Secondary match fields - Bank: {column_info['secondary_match_fields']['bank']}, Invoice: {column_info['secondary_match_fields']['invoice']}
+
+**Bank Statement Data (Complete Important Columns):**
+{bank_data.to_string()}
+
+**Invoice Data (Complete Important Columns):**
+{invoice_data.to_string()}
+
+Please perform transaction matching and return the results in the following JSON format:
+{{
+    "matches": [
+        {{
+            "bank_record_index": 0,
+            "invoice_record_index": 0,
+            "confidence_score": 0.95,
+            "match_reason": "Exact amount and date match"
+        }}
+    ],
+    "unmatched_bank_indices": [0, 1, 2],
+    "unmatched_invoice_indices": [0, 1, 2],
+    "summary": {{
+        "total_bank_records": 0,
+        "total_invoice_records": 0,
+        "matched_pairs": 0,
+        "unmatched_bank": 0,
+        "unmatched_invoices": 0
+    }}
+}}
+
+Matching Rules:
+1. Primary match: Same amount and similar dates (within 7 days)
+2. Secondary match: Similar descriptions/references and amounts
+3. Confidence scoring: 0.9+ for exact matches, 0.7+ for probable matches, 0.5+ for possible matches
+4. Only include matches with confidence >= 0.7
+
+Important: Return valid JSON only. Do not include any explanatory text outside the JSON structure.
+"""
+    return prompt
+
+# def call_gemini_api(prompt, max_retries=3):
+#     """Call Gemini API with retry logic."""
+#     for attempt in range(max_retries):
+#         try:
+#             response = model.generate_content(prompt)
+#             return response.text
+#         except Exception as e:
+#             logger.error(f"Gemini API call failed (attempt {attempt + 1}): {str(e)}")
+#             if attempt == max_retries - 1:
+#                 raise
+#     return None
+
+def call_chatgpt_api(prompt, max_retries=3):
+    """Call ChatGPT API with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            # Use the client object for the API call
+            response = client.chat.completions.create(
+                model=CHATGPT_MODEL,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            # Accessing the content from the response object
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"ChatGPT API call failed (attempt {attempt + 1}): {str(e)}")
+            if attempt == max_retries - 1:
+                raise
+    return None
+
+def parse_json_response(response_text):
+    """Parse JSON response from LLM, handling potential formatting issues."""
+    try:
+        # Try to extract JSON from the response
+        # Sometimes LLM adds extra text, so we look for JSON structure
+        start_idx = response_text.find('{')
+        end_idx = response_text.rfind('}')
+        
+        if start_idx != -1 and end_idx != -1:
+            json_str = response_text[start_idx:end_idx + 1]
+            return json.loads(json_str)
+        else:
+            # If no clear JSON structure, try the whole response
+            return json.loads(response_text)
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON response: {str(e)}")
+        logger.error(f"Response text: {response_text[:500]}...")
+        raise ValueError(f"Invalid JSON response from LLM: {str(e)}")
+
+# --- API Routes ---
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Simple health check endpoint."""
-    return jsonify({"status": "Backend is running and healthy!"}), 200
+    """Health check endpoint."""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'service': 'Financial Reconciliation Backend'
+    })
 
 @app.route('/upload', methods=['POST'])
 def upload_files():
-    """Handles file uploads, saves them, parses, and preprocesses their content."""
+    """Handle file upload and basic preprocessing."""
     try:
+        logger.info("Starting file upload process")
+        
+        # Check if files are present
         if 'bank_statement' not in request.files or 'invoices' not in request.files:
             return jsonify({
                 'success': False,
-                'error': 'Both bank_statement and invoices files are required.'
+                'error': 'Both bank_statement and invoices files are required'
             }), 400
-
+        
         bank_file = request.files['bank_statement']
         invoice_file = request.files['invoices']
-
+        
+        # Validate files
         if bank_file.filename == '' or invoice_file.filename == '':
             return jsonify({
                 'success': False,
-                'error': 'One or both file selections are empty. Please select valid files.'
+                'error': 'No files selected'
             }), 400
-
+        
         if not (allowed_file(bank_file.filename) and allowed_file(invoice_file.filename)):
             return jsonify({
                 'success': False,
-                'error': 'Unsupported file type. Only CSV and Excel (xlsx, xls) files are allowed.'
+                'error': 'Invalid file format. Allowed formats: CSV, XLSX, XLS'
             }), 400
-
-        bank_filename = secure_filename(bank_file.filename)
-        invoice_filename = secure_filename(invoice_file.filename)
-
-        bank_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"bank_{bank_filename}")
-        invoice_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"invoice_{invoice_filename}")
-
-        bank_file.save(bank_filepath)
-        invoice_file.save(invoice_filepath)
-        print(f"Saved bank file to: {bank_filepath}")
-        print(f"Saved invoice file to: {invoice_filepath}")
-
-        bank_data_parsed_result = parse_file(bank_filepath, 'bank_statement')
-        invoice_data_parsed_result = parse_file(invoice_filepath, 'invoices')
-
-        if not bank_data_parsed_result['success'] or not invoice_data_parsed_result['success']:
-            return jsonify({
-                'success': False,
-                'error': f"Error parsing files: Bank: {bank_data_parsed_result.get('error', 'N/A')}, Invoice: {invoice_data_parsed_result.get('error', 'N/A')}"
-            }), 400
-
-        # Perform preprocessing immediately after successful parsing
-        preprocessed_data = preprocess_data(bank_data_parsed_result, invoice_data_parsed_result)
-
+        
+        # Save files
+        bank_filename = secure_filename(f"bank_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{bank_file.filename}")
+        invoice_filename = secure_filename(f"invoice_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{invoice_file.filename}")
+        
+        bank_path = os.path.join(app.config['UPLOAD_FOLDER'], bank_filename)
+        invoice_path = os.path.join(app.config['UPLOAD_FOLDER'], invoice_filename)
+        
+        bank_file.save(bank_path)
+        invoice_file.save(invoice_path)
+        
+        # Read files
+        logger.info("Reading files")
+        bank_df_raw = read_file(bank_path)
+        invoice_df_raw = read_file(invoice_path)
+        
+        # Basic cleanup only
+        bank_df_clean = basic_cleanup(bank_df_raw)
+        invoice_df_clean = basic_cleanup(invoice_df_raw)
+        
+        # Encrypt sensitive data
+        bank_df_encrypted, bank_sensitive_cols = encrypt_sensitive_data(bank_df_clean)
+        invoice_df_encrypted, invoice_sensitive_cols = encrypt_sensitive_data(invoice_df_clean)
+        
+        # Store processed data for column identification step
+        session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        session_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}")
+        bank_df_encrypted.to_pickle(f"{session_file}_bank.pkl")
+        invoice_df_encrypted.to_pickle(f"{session_file}_invoice.pkl")
+        
+        # Prepare response with sample data (first 5 rows for LLM analysis)
         response_data = {
             'success': True,
-            'message': 'Files uploaded and preprocessed successfully',
-            'bank_statement_original': { # Keep original parsed data for reference if needed
-                'filename': bank_filename,
-                'columns': bank_data_parsed_result['columns'],
-                'row_count': bank_data_parsed_result['row_count'],
-                'data': bank_data_parsed_result['data']
+            'message': 'Files uploaded and basic preprocessing completed successfully',
+            'session_id': session_id,
+            'preprocessing_info': {
+                'bank_original_rows': len(bank_df_raw),
+                'bank_processed_rows': len(bank_df_encrypted),
+                'invoice_original_rows': len(invoice_df_raw),
+                'invoice_processed_rows': len(invoice_df_encrypted),
+                'bank_sensitive_columns': bank_sensitive_cols,
+                'invoice_sensitive_columns': invoice_sensitive_cols
             },
-            'invoices_original': { # Keep original parsed data for reference if needed
-                'filename': invoice_filename,
-                'columns': invoice_data_parsed_result['columns'],
-                'row_count': invoice_data_parsed_result['row_count'],
-                'data': invoice_data_parsed_result['data']
-            },
-            'bank_statement_processed': preprocessed_data['bank_data_processed'],
-            'invoices_processed': preprocessed_data['invoice_data_processed'],
-            'preprocessing_info': preprocessed_data['preprocessing_info']
+            'bank_statement_sample': bank_df_encrypted.head().to_dict('records'),
+            'invoices_sample': invoice_df_encrypted.head().to_dict('records')
         }
-        return jsonify(response_data), 200
-
+        
+        # Clean up uploaded files
+        os.remove(bank_path)
+        os.remove(invoice_path)
+        
+        logger.info("File upload and basic preprocessing completed successfully")
+        return jsonify(response_data)
+        
     except Exception as e:
-        print(f"Error in /upload endpoint: {str(e)}")
-        traceback.print_exc()
+        logger.error(f"Error in upload_files: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             'success': False,
-            'error': f'Server error during file upload: {str(e)}'
+            'error': f'File processing failed: {str(e)}'
         }), 500
 
+@app.route('/identify_columns', methods=['POST'])
+def identify_columns():
+    """Identify key columns for matching using LLM, then preprocess those columns."""
+    logger.info("=== Starting identifying columns ===")
+    print("ROUTE HIT /identify!") 
+    
+    # Initialize variables for cleanup in case of errors
+    bank_processed_file = None
+    invoice_processed_file = None
+    column_info_file = None
+    
+    try:
+        data = request.get_json()
+        session_id = data.get('session_id')
+        if not session_id:
+            return jsonify({
+                'success': False,
+                'error': 'Session ID is required'
+            }), 400
+        
+        # Load processed data
+        bank_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_bank.pkl")
+        invoice_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_invoice.pkl")
+        
+        # Check if input files exist
+        if not os.path.exists(bank_file):
+            logger.error(f"Bank file not found: {bank_file}")
+            return jsonify({
+                'success': False,
+                'error': f'Bank data file not found for session {session_id}. Please upload files again.'
+            }), 404
+            
+        if not os.path.exists(invoice_file):
+            logger.error(f"Invoice file not found: {invoice_file}")
+            return jsonify({
+                'success': False,
+                'error': f'Invoice data file not found for session {session_id}. Please upload files again.'
+            }), 404
+        
+        # Try to load the pickle files with error handling
+        try:
+            bank_df = pd.read_pickle(bank_file)
+            logger.info(f"Successfully loaded bank data: {bank_df.shape}")
+        except Exception as e:
+            logger.error(f"Failed to load bank pickle file: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'Failed to load bank data: {str(e)}'
+            }), 500
+            
+        try:
+            invoice_df = pd.read_pickle(invoice_file)
+            logger.info(f"Successfully loaded invoice data: {invoice_df.shape}")
+        except Exception as e:
+            logger.error(f"Failed to load invoice pickle file: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'Failed to load invoice data: {str(e)}'
+            }), 500
+        
+        # Validate dataframes are not empty
+        if bank_df.empty:
+            logger.error("Bank dataframe is empty")
+            return jsonify({
+                'success': False,
+                'error': 'Bank data is empty'
+            }), 400
+            
+        if invoice_df.empty:
+            logger.error("Invoice dataframe is empty")
+            return jsonify({
+                'success': False,
+                'error': 'Invoice data is empty'
+            }), 400
+        
+        # Get first 5 rows for LLM analysis
+        bank_sample = bank_df.head(5)
+        invoice_sample = invoice_df.head(5)
+        
+        # Call LLM to identify columns
+        logger.info("Calling LLM to identify key columns")
+        try:
+            prompt = get_column_identification_prompt(bank_sample, invoice_sample)
+            #llm_response = call_gemini_api(prompt)
+            llm_response = call_chatgpt_api(prompt)
+        except Exception as e:
+            logger.error(f"LLM API call failed: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'LLM API call failed: {str(e)}'
+            }), 500
 
+        # Parse response
+        try:
+            column_info = parse_json_response(llm_response)
+        except Exception as e:
+            logger.error(f"Failed to parse LLM response: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'Failed to parse LLM response: {str(e)}'
+            }), 500
+        
+        # Validate that identified columns exist in the data
+        bank_columns = list(bank_df.columns)
+        invoice_columns = list(invoice_df.columns)
+        
+        # Filter out non-existent columns and log warnings
+        original_bank_cols = column_info.get('bank_key_columns', [])
+        original_invoice_cols = column_info.get('invoice_key_columns', [])
+        
+        column_info['bank_key_columns'] = [col for col in original_bank_cols if col in bank_columns]
+        column_info['invoice_key_columns'] = [col for col in original_invoice_cols if col in invoice_columns]
+        
+        # Log any missing columns
+        missing_bank_cols = [col for col in original_bank_cols if col not in bank_columns]
+        missing_invoice_cols = [col for col in original_invoice_cols if col not in invoice_columns]
+        
+        if missing_bank_cols:
+            logger.warning(f"Bank columns not found in data: {missing_bank_cols}")
+        if missing_invoice_cols:
+            logger.warning(f"Invoice columns not found in data: {missing_invoice_cols}")
+        
+        # Check if we have any valid columns to process
+        if not column_info['bank_key_columns']:
+            logger.error("No valid bank key columns identified")
+            return jsonify({
+                'success': False,
+                'error': 'No valid bank key columns could be identified'
+            }), 400
+            
+        if not column_info['invoice_key_columns']:
+            logger.error("No valid invoice key columns identified")
+            return jsonify({
+                'success': False,
+                'error': 'No valid invoice key columns could be identified'
+            }), 400
+        
+        # Now preprocess only the important columns identified by LLM
+        logger.info("Preprocessing important columns identified by LLM")
+        try:
+            bank_df_processed = preprocess_important_columns(bank_df, column_info['bank_key_columns'], "bank statement")
+            logger.info(f"Bank preprocessing completed: {bank_df_processed.shape}")
+        except Exception as e:
+            logger.error(f"Bank preprocessing failed: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'Bank data preprocessing failed: {str(e)}'
+            }), 500
+            
+        try:
+            invoice_df_processed = preprocess_important_columns(invoice_df, column_info['invoice_key_columns'], "invoices")
+            logger.info(f"Invoice preprocessing completed: {invoice_df_processed.shape}")
+        except Exception as e:
+            logger.error(f"Invoice preprocessing failed: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'Invoice data preprocessing failed: {str(e)}'
+            }), 500
+        
+        # Validate processed dataframes
+        if bank_df_processed.empty:
+            logger.error("Processed bank dataframe is empty")
+            return jsonify({
+                'success': False,
+                'error': 'Processed bank data is empty'
+            }), 500
+            
+        if invoice_df_processed.empty:
+            logger.error("Processed invoice dataframe is empty")
+            return jsonify({
+                'success': False,
+                'error': 'Processed invoice data is empty'
+            }), 500
+        
+        # Define file paths for saving
+        bank_processed_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_bank_processed.pkl")
+        invoice_processed_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_invoice_processed.pkl")
+        column_info_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_columns.json")
+        
+        # Save preprocessed data with error handling and verification
+        try:
+            logger.info(f"Saving processed bank data to: {bank_processed_file}")
+            bank_df_processed.to_pickle(bank_processed_file)
+            
+            # Verify the file was created and is not empty
+            if not os.path.exists(bank_processed_file):
+                raise Exception(f"Bank processed file was not created: {bank_processed_file}")
+            
+            file_size = os.path.getsize(bank_processed_file)
+            if file_size == 0:
+                raise Exception(f"Bank processed file is empty: {bank_processed_file}")
+            
+            logger.info(f"✓ Bank processed file created successfully: {bank_processed_file} ({file_size} bytes)")
+            
+        except Exception as e:
+            logger.error(f"Failed to save processed bank data: {str(e)}")
+            # Clean up any partial files
+            if os.path.exists(bank_processed_file):
+                os.remove(bank_processed_file)
+            return jsonify({
+                'success': False,
+                'error': f'Failed to save processed bank data: {str(e)}'
+            }), 500
+        
+        try:
+            logger.info(f"Saving processed invoice data to: {invoice_processed_file}")
+            invoice_df_processed.to_pickle(invoice_processed_file)
+            
+            # Verify the file was created and is not empty
+            if not os.path.exists(invoice_processed_file):
+                raise Exception(f"Invoice processed file was not created: {invoice_processed_file}")
+            
+            file_size = os.path.getsize(invoice_processed_file)
+            if file_size == 0:
+                raise Exception(f"Invoice processed file is empty: {invoice_processed_file}")
+            
+            logger.info(f"✓ Invoice processed file created successfully: {invoice_processed_file} ({file_size} bytes)")
+            
+        except Exception as e:
+            logger.error(f"Failed to save processed invoice data: {str(e)}")
+            # Clean up any partial files
+            if os.path.exists(invoice_processed_file):
+                os.remove(invoice_processed_file)
+            if os.path.exists(bank_processed_file):
+                os.remove(bank_processed_file)
+            return jsonify({
+                'success': False,
+                'error': f'Failed to save processed invoice data: {str(e)}'
+            }), 500
+        
+        # Save column info with error handling
+        try:
+            logger.info(f"Saving column info to: {column_info_file}")
+            with open(column_info_file, 'w') as f:
+                json.dump(column_info, f, indent=2)
+            
+            # Verify the file was created and is not empty
+            if not os.path.exists(column_info_file):
+                raise Exception(f"Column info file was not created: {column_info_file}")
+                
+            file_size = os.path.getsize(column_info_file)
+            if file_size == 0:
+                raise Exception(f"Column info file is empty: {column_info_file}")
+            
+            logger.info(f"✓ Column info file created successfully: {column_info_file} ({file_size} bytes)")
+            
+        except Exception as e:
+            logger.error(f"Failed to save column info: {str(e)}")
+            # Clean up any partial files
+            for file_path in [column_info_file, bank_processed_file, invoice_processed_file]:
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
+            return jsonify({
+                'success': False,
+                'error': f'Failed to save column information: {str(e)}'
+            }), 500
+        
+        # Final verification - try to read back the files to ensure they're valid
+        try:
+            # Test reading back the pickle files
+            test_bank_df = pd.read_pickle(bank_processed_file)
+            test_invoice_df = pd.read_pickle(invoice_processed_file)
+            
+            # Test reading back the JSON file
+            with open(column_info_file, 'r') as f:
+                test_column_info = json.load(f)
+                
+            logger.info("✓ All files successfully verified by reading them back")
+            
+        except Exception as e:
+            logger.error(f"File verification failed: {str(e)}")
+            # Clean up files that can't be read
+            for file_path in [column_info_file, bank_processed_file, invoice_processed_file]:
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
+            return jsonify({
+                'success': False,
+                'error': f'File verification failed - files may be corrupted: {str(e)}'
+            }), 500
+        
+        logger.info("Column identification and preprocessing completed successfully")
+        
+        # Create detailed response with file status
+        response_data = {
+            'success': True,
+            'column_info': column_info,
+            'message': 'Key columns identified and preprocessed successfully',
+            'preprocessing_summary': {
+                'bank_key_columns_processed': column_info['bank_key_columns'],
+                'invoice_key_columns_processed': column_info['invoice_key_columns'],
+                'bank_rows_processed': len(bank_df_processed),
+                'invoice_rows_processed': len(invoice_df_processed)
+            },
+            'files_created': {
+                'bank_processed_file': {
+                    'path': bank_processed_file,
+                    'size_bytes': os.path.getsize(bank_processed_file),
+                    'exists': True
+                },
+                'invoice_processed_file': {
+                    'path': invoice_processed_file,
+                    'size_bytes': os.path.getsize(invoice_processed_file),
+                    'exists': True
+                },
+                'column_info_file': {
+                    'path': column_info_file,
+                    'size_bytes': os.path.getsize(column_info_file),
+                    'exists': True
+                }
+            }
+        }
+        
+        # Add warnings if any columns were missing
+        if missing_bank_cols or missing_invoice_cols:
+            response_data['warnings'] = {
+                'missing_bank_columns': missing_bank_cols,
+                'missing_invoice_columns': missing_invoice_cols
+            }
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"Error in identify_columns: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        # Clean up any partially created files
+        cleanup_files = [bank_processed_file, invoice_processed_file, column_info_file]
+        for file_path in cleanup_files:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.info(f"Cleaned up partial file: {file_path}")
+                except Exception as cleanup_error:
+                    logger.error(f"Failed to clean up file {file_path}: {cleanup_error}")
+        
+        return jsonify({
+            'success': False,
+            'error': f'Column identification failed: {str(e)}',
+            'files_created': {
+                'bank_processed_file': {'exists': False},
+                'invoice_processed_file': {'exists': False},
+                'column_info_file': {'exists': False}
+            }
+        }), 500
+    
 @app.route('/match', methods=['POST'])
 def match_transactions():
-    """
-    API endpoint to perform AI-powered matching between bank transactions and invoices.
-    Expects preprocessed bank and invoice data.
-    """
+    """Perform AI-powered transaction matching using complete preprocessed important columns."""
+    logger.info("=== Starting transaction matching process ===")
+    print("ROUTE HIT!") 
+    
     try:
-        request_data = request.get_json()
-        if not request_data:
-            return jsonify({'success': False, 'error': 'No JSON data received for matching.'}), 400
+        # Step 1: Get request data
+        logger.info("Step 1: Extracting request data")
+        try:
+            data = request.get_json()
+            logger.info(f"Request data received: {data}")
+        except Exception as e:
+            logger.error(f"Error parsing JSON request: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': 'Invalid JSON in request body'
+            }), 400
+        
+        # Step 2: Validate session ID
+        logger.info("Step 2: Validating session ID")
+        session_id = data.get('session_id')
+        if not session_id:
+            logger.error("Session ID is missing from request")
+            return jsonify({
+                'success': False,
+                'error': 'Session ID is required'
+            }), 400
+        
+        logger.info(f"Session ID: {session_id}")
+        
+        # Step 3: Construct file paths
+        logger.info("Step 3: Constructing file paths")
+        try:
+            bank_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_bank_processed.pkl")
+            invoice_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_invoice_processed.pkl")
+            column_file = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_columns.json")
+            
+            logger.info(f"Bank file path: {bank_file}")
+            logger.info(f"Invoice file path: {invoice_file}")
+            logger.info(f"Column file path: {column_file}")
+        except Exception as e:
+            logger.error(f"Error constructing file paths: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': 'Error constructing file paths'
+            }), 500
 
-        bank_data_raw = request_data.get('bank_data')
-        invoice_data_raw = request_data.get('invoice_data')
-
-        if not bank_data_raw or not invoice_data_raw:
-            return jsonify({'success': False, 'error': 'Missing bank_data or invoice_data in request.'}), 400
-
-        # Convert to DataFrame for easier processing
-        bank_df = pd.DataFrame(bank_data_raw)
-        invoice_df = pd.DataFrame(invoice_data_raw)
-
-        # --- CRITICAL FIX: Re-ensure correct data types after JSON roundtrip ---
-        # Convert Amount columns to numeric
-        bank_df['Amount'] = pd.to_numeric(bank_df['Amount'], errors='coerce')
-        invoice_df['Amount'] = pd.to_numeric(invoice_df['Amount'], errors='coerce')
-
-        # Convert Date columns to datetime objects
-        bank_df['Date'] = pd.to_datetime(bank_df['Date'], errors='coerce')
-        invoice_df['Date'] = pd.to_datetime(invoice_df['Date'], errors='coerce')
-
-        # Filter out rows where crucial columns became NaN/NaT after conversion
-        # This prevents type errors later in calculations
-        bank_df_filtered = bank_df.dropna(subset=['Amount', 'Date', 'Description_Clean']).reset_index(drop=True)
-        invoice_df_filtered = invoice_df.dropna(subset=['Amount', 'Date', 'Description_Clean']).reset_index(drop=True)
-
-        print(f"Bank data types after re-conversion for matching:\n{bank_df_filtered[['Date', 'Amount', 'Description_Clean']].dtypes}")
-        print(f"Invoice data types after re-conversion for matching:\n{invoice_df_filtered[['Date', 'Amount', 'Description_Clean']].dtypes}")
-        print(f"Bank entries after filtering for matching: {len(bank_df_filtered)}")
-        print(f"Invoice entries after filtering for matching: {len(invoice_df_filtered)}")
-
-
-        # Generate embeddings for descriptions
-        bank_df_filtered['embedding'] = bank_df_filtered['Description_Clean'].apply(
-            lambda x: get_embedding(x, model="models/embedding-001")
-        )
-        invoice_df_filtered['embedding'] = invoice_df_filtered['Description_Clean'].apply(
-            lambda x: get_embedding(x, model="models/embedding-001")
-        )
-
-        # Drop rows where embedding generation failed (embedding is None)
-        bank_df_embedded = bank_df_filtered.dropna(subset=['embedding']).reset_index(drop=True)
-        invoice_df_embedded = invoice_df_filtered.dropna(subset=['embedding']).reset_index(drop=True)
-
-        print(f"Bank entries with valid embeddings: {len(bank_df_embedded)}")
-        print(f"Invoice entries with valid embeddings: {len(invoice_df_embedded)}")
-
-        matched_transactions = []
-        unmatched_bank_indices = set(bank_df_embedded.index)
-        unmatched_invoice_indices = set(invoice_df_embedded.index)
-
-        # Iterate through bank transactions to find matches
-        for bank_idx, bank_row in bank_df_embedded.iterrows():
-            if bank_idx not in unmatched_bank_indices:
-                continue # Already matched
-
-            best_match = None
-            max_confidence = 0.0
-
-            for invoice_idx, invoice_row in invoice_df_embedded.iterrows():
-                if invoice_idx not in unmatched_invoice_indices:
-                    continue # Already matched
-
-                # --- 1. Amount Match ---
-                amount_matched = abs(bank_row['Amount'] - invoice_row['Amount']) <= AMOUNT_TOLERANCE
-
-                # --- 2. Date Match ---
-                date_matched = False
-                # Ensure dates are not NaT before calculating difference
-                if pd.notna(bank_row['Date']) and pd.notna(invoice_row['Date']):
-                    date_difference = abs(bank_row['Date'] - invoice_row['Date']).days
-                    date_matched = date_difference <= DATE_TOLERANCE_DAYS
-
-                # --- 3. Semantic Similarity Match ---
-                semantic_score = None
-                if bank_row['embedding'] is not None and invoice_row['embedding'] is not None:
-                    # Reshape for cosine_similarity: (1, n_features)
-                    bank_embedding = np.array(bank_row['embedding']).reshape(1, -1)
-                    invoice_embedding = np.array(invoice_row['embedding']).reshape(1, -1)
-                    semantic_score = cosine_similarity(bank_embedding, invoice_embedding)[0][0]
-
-                # Calculate overall confidence based on adjusted priorities
-                confidence, match_reason = calculate_confidence(
-                    amount_matched, date_matched, semantic_score
-                )
-
-                # Prioritize matches with higher confidence and meeting semantic threshold
-                if confidence > max_confidence and (semantic_score is None or semantic_score >= SEMANTIC_SIMILARITY_THRESHOLD):
-                    best_match = {
-                        "bank_idx": bank_idx,
-                        "invoice_idx": invoice_idx,
-                        "confidence_score": confidence,
-                        "match_reason": match_reason
+        # Step 4: Check file existence
+        logger.info("Step 4: Checking file existence")
+        missing_files = []
+        for file_path in [bank_file, invoice_file, column_file]:
+            if not os.path.exists(file_path):
+                missing_files.append(file_path)
+                logger.error(f"Missing file: {file_path}")
+            else:
+                logger.info(f"File exists: {file_path}")
+        
+        if missing_files:
+            logger.error(f"Missing files: {missing_files}")
+            return jsonify({
+                'success': False,
+                'error': f'Session data not found. Missing files: {missing_files}. Please complete previous steps.'
+            }), 404
+        
+        # Step 5: Load data files
+        logger.info("Step 5: Loading data files")
+        
+        # Load bank data
+        try:
+            logger.info("Loading bank data...")
+            bank_df_full = pd.read_pickle(bank_file)
+            logger.info(f"Bank data loaded successfully. Shape: {bank_df_full.shape}")
+            logger.info(f"Bank data columns: {list(bank_df_full.columns)}")
+        except Exception as e:
+            logger.error(f"Error loading bank data: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error loading bank data: {str(e)}'
+            }), 500
+        
+        # Load invoice data
+        try:
+            logger.info("Loading invoice data...")
+            invoice_df_full = pd.read_pickle(invoice_file)
+            logger.info(f"Invoice data loaded successfully. Shape: {invoice_df_full.shape}")
+            logger.info(f"Invoice data columns: {list(invoice_df_full.columns)}")
+        except Exception as e:
+            logger.error(f"Error loading invoice data: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error loading invoice data: {str(e)}'
+            }), 500
+        
+        # Load column info
+        try:
+            logger.info("Loading column info...")
+            with open(column_file, 'r') as f:
+                column_info = json.load(f)
+            logger.info(f"Column info loaded successfully: {column_info}")
+        except Exception as e:
+            logger.error(f"Error loading column info: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error loading column info: {str(e)}'
+            }), 500
+        
+        # Step 6: Extract important columns
+        logger.info("Step 6: Extracting important columns")
+        
+        try:
+            # Validate column info structure
+            if 'bank_key_columns' not in column_info:
+                logger.error("bank_key_columns not found in column_info")
+                return jsonify({
+                    'success': False,
+                    'error': 'bank_key_columns not found in column info'
+                }), 500
+            
+            if 'invoice_key_columns' not in column_info:
+                logger.error("invoice_key_columns not found in column_info")
+                return jsonify({
+                    'success': False,
+                    'error': 'invoice_key_columns not found in column info'
+                }), 500
+            
+            logger.info(f"Bank key columns: {column_info['bank_key_columns']}")
+            logger.info(f"Invoice key columns: {column_info['invoice_key_columns']}")
+            
+            # Check if key columns exist in dataframes
+            missing_bank_cols = [col for col in column_info['bank_key_columns'] if col not in bank_df_full.columns]
+            missing_invoice_cols = [col for col in column_info['invoice_key_columns'] if col not in invoice_df_full.columns]
+            
+            if missing_bank_cols:
+                logger.error(f"Missing bank columns: {missing_bank_cols}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Missing bank columns: {missing_bank_cols}'
+                }), 500
+            
+            if missing_invoice_cols:
+                logger.error(f"Missing invoice columns: {missing_invoice_cols}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Missing invoice columns: {missing_invoice_cols}'
+                }), 500
+            
+            # Extract important columns
+            bank_important_data = bank_df_full[column_info['bank_key_columns']].copy()
+            invoice_important_data = invoice_df_full[column_info['invoice_key_columns']].copy()
+            
+            logger.info(f"Bank important data shape: {bank_important_data.shape}")
+            logger.info(f"Invoice important data shape: {invoice_important_data.shape}")
+            logger.info(f"Bank important data sample:\n{bank_important_data.head()}")
+            logger.info(f"Invoice important data sample:\n{invoice_important_data.head()}")
+            
+        except Exception as e:
+            logger.error(f"Error extracting important columns: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error extracting important columns: {str(e)}'
+            }), 500
+        
+        # Step 7: Prepare batching
+        logger.info("Step 7: Preparing data for LLM processing")
+        
+        try:
+            logger.info(f"Sending complete important columns data to LLM for matching")
+            logger.info(f"Bank records: {len(bank_important_data)}, Invoice records: {len(invoice_important_data)}")
+            
+            max_records_per_batch = 200  # Adjust based on API limits
+            
+            if len(bank_important_data) > max_records_per_batch or len(invoice_important_data) > max_records_per_batch:
+                # Process in batches for large datasets
+                bank_batch = bank_important_data.head(max_records_per_batch)
+                invoice_batch = invoice_important_data.head(max_records_per_batch)
+                logger.info(f"Processing in batches due to large dataset size")
+                logger.info(f"Bank batch size: {len(bank_batch)}, Invoice batch size: {len(invoice_batch)}")
+            else:
+                # Process complete dataset
+                bank_batch = bank_important_data
+                invoice_batch = invoice_important_data
+                logger.info(f"Processing complete dataset")
+            
+            logger.info(f"Final batch sizes - Bank: {len(bank_batch)}, Invoice: {len(invoice_batch)}")
+            
+        except Exception as e:
+            logger.error(f"Error preparing batches: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error preparing data batches: {str(e)}'
+            }), 500
+        
+        # Step 8: Generate prompt and call LLM
+        logger.info("Step 8: Calling LLM for matching")
+        
+        try:
+            logger.info("Generating matching prompt...")
+            prompt = get_matching_prompt(bank_batch, invoice_batch, column_info)
+            logger.info(f"Prompt generated successfully (length: {len(prompt)} characters)")
+            logger.info(f"Prompt preview: {prompt[:500]}...")
+            
+        except Exception as e:
+            logger.error(f"Error generating prompt: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error generating prompt: {str(e)}'
+            }), 500
+        
+        try:
+            logger.info("Calling ChatGPT API...")
+            llm_response = call_chatgpt_api(prompt)
+            logger.info(f"LLM response received (length: {len(str(llm_response))} characters)")
+            logger.info(f"LLM response preview: {str(llm_response)[:500]}...")
+            
+        except Exception as e:
+            logger.error(f"Error calling ChatGPT API: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error calling ChatGPT API: {str(e)}'
+            }), 500
+        
+        # Step 9: Parse matching results
+        logger.info("Step 9: Parsing matching results")
+        
+        try:
+            logger.info("Parsing JSON response...")
+            matching_results = parse_json_response(llm_response)
+            logger.info(f"Matching results parsed successfully")
+            logger.info(f"Matching results structure: {type(matching_results)}")
+            logger.info(f"Matching results keys: {list(matching_results.keys()) if isinstance(matching_results, dict) else 'Not a dict'}")
+            
+            if isinstance(matching_results, dict) and 'matches' in matching_results:
+                logger.info(f"Number of matches found: {len(matching_results['matches'])}")
+            else:
+                logger.warning(f"Unexpected matching results structure: {matching_results}")
+                
+        except Exception as e:
+            logger.error(f"Error parsing matching results: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error parsing matching results: {str(e)}'
+            }), 500
+        
+        # Step 10: Enhance results with full record data
+        logger.info("Step 10: Enhancing results with full record data")
+        
+        try:
+            enhanced_matches = []
+            matches = matching_results.get('matches', [])
+            logger.info(f"Processing {len(matches)} matches for enhancement")
+            
+            for i, match in enumerate(matches):
+                try:
+                    logger.info(f"Processing match {i+1}/{len(matches)}")
+                    
+                    if 'bank_record_index' not in match:
+                        logger.error(f"Match {i+1} missing bank_record_index: {match}")
+                        continue
+                    
+                    if 'invoice_record_index' not in match:
+                        logger.error(f"Match {i+1} missing invoice_record_index: {match}")
+                        continue
+                    
+                    bank_idx = match['bank_record_index']
+                    invoice_idx = match['invoice_record_index']
+                    
+                    logger.info(f"Match {i+1} - Bank index: {bank_idx}, Invoice index: {invoice_idx}")
+                    
+                    # Validate indices
+                    if bank_idx >= len(bank_df_full):
+                        logger.error(f"Bank index {bank_idx} out of range (max: {len(bank_df_full)-1})")
+                        continue
+                    
+                    if invoice_idx >= len(invoice_df_full):
+                        logger.error(f"Invoice index {invoice_idx} out of range (max: {len(invoice_df_full)-1})")
+                        continue
+                    
+                    # Get full records from original data
+                    bank_full_record = bank_df_full.iloc[bank_idx].to_dict()
+                    invoice_full_record = invoice_df_full.iloc[invoice_idx].to_dict()
+                    
+                    enhanced_match = {
+                        'file_a_entry': bank_full_record,
+                        'file_b_entry': invoice_full_record,
+                        'confidence_score': match.get('confidence_score', 0),
+                        'match_reason': match.get('match_reason', 'No reason provided')
                     }
-                    max_confidence = confidence
-
-            if best_match:
-                # Add to matched transactions list
-                # Convert datetime objects to string for JSON serialization
-                file_a_entry = bank_df_embedded.loc[best_match['bank_idx']].drop('embedding').to_dict()
-                file_b_entry = invoice_df_embedded.loc[best_match['invoice_idx']].drop('embedding').to_dict()
-
-                # Format Date objects in dicts for JSON to ISO format
-                if 'Date' in file_a_entry and pd.notna(file_a_entry['Date']):
-                    file_a_entry['Date'] = file_a_entry['Date'].isoformat()
-                if 'Date' in file_b_entry and pd.notna(file_b_entry['Date']):
-                    file_b_entry['Date'] = file_b_entry['Date'].isoformat()
-
-                matched_transactions.append({
-                    "file_a_entry": file_a_entry,
-                    "file_b_entry": file_b_entry,
-                    "confidence_score": round(best_match['confidence_score'], 4),
-                    "match_reason": best_match['match_reason']
-                })
-
-                # Mark indices as matched
-                unmatched_bank_indices.discard(best_match['bank_idx'])
-                unmatched_invoice_indices.discard(best_match['invoice_idx'])
-
-        # Prepare unmatched entries
-        unmatched_bank_entries = []
-        for idx in unmatched_bank_indices:
-            entry = bank_df_embedded.loc[idx].drop('embedding').to_dict()
-            if 'Date' in entry and pd.notna(entry['Date']):
-                entry['Date'] = entry['Date'].isoformat()
-            unmatched_bank_entries.append(entry)
-
-        unmatched_invoice_entries = []
-        for idx in unmatched_invoice_indices:
-            entry = invoice_df_embedded.loc[idx].drop('embedding').to_dict()
-            if 'Date' in entry and pd.notna(entry['Date']):
-                entry['Date'] = entry['Date'].isoformat()
-            unmatched_invoice_entries.append(entry)
-
-        return jsonify({
-            'success': True,
-            'message': f'AI Matching completed. Found {len(matched_transactions)} matches.',
-            'matches': matched_transactions,
-            'unmatched_file_a_entries': unmatched_bank_entries,
-            'unmatched_file_b_entries': unmatched_invoice_entries
-        }), 200
-
+                    enhanced_matches.append(enhanced_match)
+                    logger.info(f"Match {i+1} enhanced successfully")
+                    
+                except Exception as e:
+                    logger.error(f"Error enhancing match {i+1}: {str(e)}")
+                    logger.error(f"Problematic match data: {match}")
+                    continue
+            
+            logger.info(f"Enhanced {len(enhanced_matches)} matches successfully")
+            
+        except Exception as e:
+            logger.error(f"Error enhancing matches: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error enhancing matches: {str(e)}'
+            }), 500
+        
+        # Step 11: Get unmatched records
+        logger.info("Step 11: Identifying unmatched records")
+        
+        try:
+            matched_bank_indices = [m['bank_record_index'] for m in matching_results.get('matches', []) if 'bank_record_index' in m]
+            matched_invoice_indices = [m['invoice_record_index'] for m in matching_results.get('matches', []) if 'invoice_record_index' in m]
+            
+            logger.info(f"Matched bank indices: {matched_bank_indices}")
+            logger.info(f"Matched invoice indices: {matched_invoice_indices}")
+            
+            unmatched_bank = bank_df_full[~bank_df_full.index.isin(matched_bank_indices)].to_dict('records')
+            unmatched_invoices = invoice_df_full[~invoice_df_full.index.isin(matched_invoice_indices)].to_dict('records')
+            
+            logger.info(f"Unmatched bank records: {len(unmatched_bank)}")
+            logger.info(f"Unmatched invoice records: {len(unmatched_invoices)}")
+            
+        except Exception as e:
+            logger.error(f"Error identifying unmatched records: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error identifying unmatched records: {str(e)}'
+            }), 500
+        
+        # Step 12: Prepare final response
+        logger.info("Step 12: Preparing final response")
+        
+        try:
+            final_results = {
+                'success': True,
+                'message': f'Matching completed. Found {len(enhanced_matches)} matches.',
+                'matches': enhanced_matches,
+                'unmatched_file_a_entries': unmatched_bank,
+                'unmatched_file_b_entries': unmatched_invoices,
+                'summary': {
+                    'total_bank_records': len(bank_df_full),
+                    'total_invoice_records': len(invoice_df_full),
+                    'matched_pairs': len(enhanced_matches),
+                    'unmatched_bank': len(unmatched_bank),
+                    'unmatched_invoices': len(unmatched_invoices)
+                },
+                'column_info': column_info
+            }
+            
+            logger.info(f"Final results summary: {final_results['summary']}")
+            
+        except Exception as e:
+            logger.error(f"Error preparing final response: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'Error preparing final response: {str(e)}'
+            }), 500
+        
+        # Step 13: Clean up session files
+        logger.info("Step 13: Cleaning up session files")
+        
+        try:
+            session_files = [
+                f"{session_id}_bank.pkl",
+                f"{session_id}_invoice.pkl",
+                f"{session_id}_bank_processed.pkl",
+                f"{session_id}_invoice_processed.pkl",
+                f"{session_id}_columns.json"
+            ]
+            
+            cleaned_files = []
+            for filename in session_files:
+                file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        cleaned_files.append(filename)
+                        logger.info(f"Cleaned up file: {filename}")
+                    else:
+                        logger.info(f"File not found for cleanup: {filename}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up file {filename}: {str(e)}")
+            
+            logger.info(f"Cleaned up {len(cleaned_files)} files: {cleaned_files}")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            # Don't fail the request for cleanup errors
+        
+        logger.info("=== Transaction matching completed successfully ===")
+        return jsonify(final_results)
+        
     except Exception as e:
-        print(f"Error in /match endpoint: {str(e)}")
-        traceback.print_exc()
+        logger.error(f"=== CRITICAL ERROR in match_transactions ===")
+        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return jsonify({
             'success': False,
-            'error': f'Server error during matching: {str(e)}'
+            'error': f'Transaction matching failed: {str(e)}'
         }), 500
-
+    
 if __name__ == '__main__':
-    import os
-    import logging
-    
-    # Configure logger for local development
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    logger = logging.getLogger(__name__)
-    
-    logger.info(f"Starting Flask application")
-    logger.info(f"Upload folder: {app.config['UPLOAD_FOLDER']}")
-    logger.info(f"Max file size: {app.config['MAX_CONTENT_LENGTH'] / (1024*1024):.0f}MB")
-    
-    # Get port from environment (for production) or use 5000 (for development)
     port = int(os.environ.get('PORT', 5000))
-    debug_mode = os.environ.get('FLASK_ENV') != 'production'
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
     
-    app.run(debug=debug_mode, host='0.0.0.0', port=port)
+    logger.info(f"Starting Financial Reconciliation Backend on port {port}")
+    logger.info(f"Debug mode: {debug_mode}")
+    logger.info(f"Upload folder: {UPLOAD_FOLDER}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
