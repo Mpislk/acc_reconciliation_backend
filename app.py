@@ -64,7 +64,6 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
 cipher_suite = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
 
 # --- Helper Functions ---
-
 def allowed_file(filename):
     """Check if the file extension is allowed."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -286,10 +285,10 @@ Please perform transaction matching and return the results in the following JSON
 }}
 
 Matching Rules:
-1. Primary match: Same amount and similar dates (within 7 days)
-2. Secondary match: Similar descriptions/references and amounts
-3. Confidence scoring: 0.9+ for exact matches, 0.7+ for probable matches, 0.5+ for possible matches
-4. Only include matches with confidence >= 0.7
+1. Primary match: Compare amount columns in bothe tables. IF you find records with some amount in bank statement and same credit amount in invoice, add them immediately into matched transactions.
+2. Secondary match: Then look for amount combinations (sum of multiple amounts in invoices equal single amount in bank statement on date after dates in invoices) 
+3. Confidence scoring: 0.7+ for exact matches, 0.5+ for probable matches, 0.5+ for possible matches
+4. Only include matches with confidence >= 0.5
 
 Important: Return valid JSON only. Do not include any explanatory text outside the JSON structure.
 """
@@ -345,6 +344,40 @@ def parse_json_response(response_text):
         logger.error(f"Failed to parse JSON response: {str(e)}")
         logger.error(f"Response text: {response_text[:500]}...")
         raise ValueError(f"Invalid JSON response from LLM: {str(e)}")
+
+
+def decrypt_sensitive_data(df_encrypted, sensitive_columns):
+    """Decrypt sensitive data in the DataFrame."""
+    df_decrypted = df_encrypted.copy()
+    
+    for col in sensitive_columns:
+        if col in df_decrypted.columns:
+            df_decrypted[col] = df_decrypted[col].apply(
+                lambda x: cipher_suite.decrypt(x.encode()).decode() if pd.notna(x) and x != '' else x
+            )
+    
+    logger.info(f"Decrypted sensitive columns: {sensitive_columns}")
+    return df_decrypted
+
+# Alternative version if you need to handle the column identification within the function
+def decrypt_sensitive_data_auto(df_encrypted):
+    """Decrypt sensitive data in the DataFrame with automatic column detection."""
+    df_decrypted = df_encrypted.copy()
+    sensitive_columns = identify_sensitive_columns(df_encrypted)
+    
+    for col in sensitive_columns:
+        if col in df_decrypted.columns:
+            try:
+                df_decrypted[col] = df_decrypted[col].apply(
+                    lambda x: cipher_suite.decrypt(x.encode()).decode() if pd.notna(x) and x != '' else x
+                )
+            except Exception as e:
+                logger.warning(f"Failed to decrypt column {col}: {e}")
+                # Keep original value if decryption fails
+                continue
+    
+    logger.info(f"Decrypted sensitive columns: {sensitive_columns}")
+    return df_decrypted
 
 # --- API Routes ---
 
@@ -433,8 +466,8 @@ def upload_files():
         }
         
         # Clean up uploaded files
-        os.remove(bank_path)
-        os.remove(invoice_path)
+        # os.remove(bank_path)
+        # os.remove(invoice_path)
         
         logger.info("File upload and basic preprocessing completed successfully")
         return jsonify(response_data)
@@ -1132,7 +1165,10 @@ def match_transactions():
         
         # Step 12: Prepare final response
         logger.info("Step 12: Preparing final response")
-        
+        # match_table = decrypt_sensitive_data_auto(pd.DataFrame(enhanced_matches))
+        # unmatched_bank_table = decrypt_sensitive_data_auto(pd.DataFrame(unmatched_bank))
+        # unmatched_invoices_table = decrypt_sensitive_data_auto(pd.DataFrame(unmatched_invoices))
+
         try:
             final_results = {
                 'success': True,
